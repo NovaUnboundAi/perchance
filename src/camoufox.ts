@@ -60,11 +60,14 @@ class PlaywrightContextAdapter implements BrowserContext {
   }
 
   async close(): Promise<void> {
-    await this.ctx.close();
-    // Close the underlying browser too — not just the context — to prevent orphaned processes.
+    // If this adapter owns the browser (non-pooled), close context + browser.
+    // If pooled (browser === null), closing the shared context would kill it for
+    // other consumers — so just let the idle timer handle cleanup.
     if (this.browser) {
+      await this.ctx.close();
       try { await this.browser.close(); } catch { /* already closed */ }
     }
+    // Pooled: no-op. Caller should close individual pages instead.
   }
 }
 
