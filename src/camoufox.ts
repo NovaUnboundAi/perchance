@@ -38,12 +38,20 @@ type PlaywrightContext = {
   close(): Promise<void>;
 };
 
+type PlaywrightBrowser = {
+  newContext(opts?: Record<string, unknown>): Promise<PlaywrightContext>;
+  close(): Promise<void>;
+  isConnected(): boolean;
+};
+
 /** Adapter that wraps a Playwright/Camoufox context into our interface. */
 class PlaywrightContextAdapter implements BrowserContext {
   private ctx: PlaywrightContext;
+  private browser: PlaywrightBrowser | null;
 
-  constructor(ctx: PlaywrightContext) {
+  constructor(ctx: PlaywrightContext, browser?: PlaywrightBrowser | null) {
     this.ctx = ctx;
+    this.browser = browser ?? null;
   }
 
   async newPage(): Promise<BrowserPage> {
@@ -53,6 +61,10 @@ class PlaywrightContextAdapter implements BrowserContext {
 
   async close(): Promise<void> {
     await this.ctx.close();
+    // Close the underlying browser too — not just the context — to prevent orphaned processes.
+    if (this.browser) {
+      try { await this.browser.close(); } catch { /* already closed */ }
+    }
   }
 }
 
@@ -136,8 +148,32 @@ export interface LaunchOptions {
  * npm install camoufox-js
  * ```
  */
+// --- Module-level browser pool singleton ---
+
+let pooledBrowser: PlaywrightBrowser | null = null;
+let pooledContext: PlaywrightContext | null = null;
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+function armIdleTimer(): void {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    if (pooledContext) { try { pooledContext.close(); } catch { /* ignore */ } }
+    if (pooledBrowser) { try { pooledBrowser.close(); } catch { /* ignore */ } }
+    pooledContext = null;
+    pooledBrowser = null;
+    idleTimer = null;
+  }, IDLE_TIMEOUT_MS);
+}
+
 export async function launchCamoufox(options: LaunchOptions = {}): Promise<BrowserContext> {
   const { headless = true, ...rest } = options;
+
+  // Reuse pooled browser if alive
+  if (pooledBrowser && pooledBrowser.isConnected() && pooledContext) {
+    armIdleTimer();
+    return new PlaywrightContextAdapter(pooledContext, null); // null = don't close browser on adapter.close()
+  }
 
   // Dynamic import so camoufox-js is optional
   // @ts-ignore - camoufox-js is an optional peer dependency
@@ -155,13 +191,25 @@ export async function launchCamoufox(options: LaunchOptions = {}): Promise<Brows
 
   // camoufox-js may return either a Browser or a BrowserContext
   if ('newPage' in browserOrContext && 'browser' in browserOrContext && typeof (browserOrContext as any).browser === 'function') {
-    // Already a BrowserContext
-    return new PlaywrightContextAdapter(browserOrContext as unknown as PlaywrightContext);
+    // Already a BrowserContext — extract the browser for proper cleanup
+    pooledContext = browserOrContext as unknown as PlaywrightContext;
+    pooledBrowser = (browserOrContext as any).browser() as PlaywrightBrowser | null;
+    armIdleTimer();
+    return new PlaywrightContextAdapter(pooledContext, null);
   }
 
   // It's a Browser, need to create a context
-  const ctx = await (browserOrContext as any).newContext();
-  return new PlaywrightContextAdapter(ctx as PlaywrightContext);
+  const browser = browserOrContext as unknown as PlaywrightBrowser;
+  const ctx = await browser.newContext();
+  pooledBrowser = browser;
+  pooledContext = ctx;
+  (pooledBrowser as any).on?.('disconnected', () => {
+    pooledBrowser = null;
+    pooledContext = null;
+    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  });
+  armIdleTimer();
+  return new PlaywrightContextAdapter(ctx, null);
 }
 
 /**
