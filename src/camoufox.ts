@@ -268,7 +268,7 @@ if (!(globalThis as any).__perchance_camoufox_loaded) {
 if (!(globalThis as any).__perchance_camoufox_shutdown_hook_installed) {
   (globalThis as any).__perchance_camoufox_shutdown_hook_installed = true;
   const killPooledBrowser = () => {
-    const pid = pooledBrowser?.process?.()?.pid;
+    const pid = typeof pooledBrowser?.process === 'function' ? pooledBrowser.process()?.pid ?? null : null;
     if (typeof pid === "number") killProcessTree(pid);
     void clearBrowserLock();
   };
@@ -314,7 +314,7 @@ export async function launchCamoufox(options: LaunchOptions = {}): Promise<Brows
       // Already a BrowserContext — extract the browser for proper cleanup
       pooledContext = browserOrContext as unknown as PlaywrightContext;
       pooledBrowser = (browserOrContext as any).browser() as PlaywrightBrowser | null;
-      const pid = pooledBrowser?.process?.()?.pid;
+      const pid = typeof pooledBrowser?.process === 'function' ? pooledBrowser.process()?.pid ?? null : null;
       if (typeof pid === "number") void writeBrowserLock(pid);
       armIdleTimer();
       return new PlaywrightContextAdapter(pooledContext, null);
@@ -325,7 +325,7 @@ export async function launchCamoufox(options: LaunchOptions = {}): Promise<Brows
     const ctx = await browser.newContext();
     pooledBrowser = browser;
     pooledContext = ctx;
-    const pid = pooledBrowser.process?.()?.pid;
+    const pid = typeof pooledBrowser?.process === 'function' ? pooledBrowser.process()?.pid ?? null : null;
     if (typeof pid === "number") void writeBrowserLock(pid);
     (pooledBrowser as any).on?.('disconnected', () => {
       pooledBrowser = null;
