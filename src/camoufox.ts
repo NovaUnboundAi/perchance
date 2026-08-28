@@ -6,6 +6,12 @@
  * which provides anti-detect fingerprinting out of the box.
  */
 
+import { execFileSync } from "node:child_process";
+import { readFile, writeFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import type { BrowserContext, BrowserPage, BrowserFrame, BrowserResponse } from "./generator.js";
 
 // We dynamically import camoufox-js so it's an optional peer dependency.
@@ -42,6 +48,7 @@ type PlaywrightBrowser = {
   newContext(opts?: Record<string, unknown>): Promise<PlaywrightContext>;
   close(): Promise<void>;
   isConnected(): boolean;
+  process?(): { pid: number } | null;
 };
 
 /** Adapter that wraps a Playwright/Camoufox context into our interface. */
@@ -151,6 +158,84 @@ export interface LaunchOptions {
  * npm install camoufox-js
  * ```
  */
+// --- Crash-safe browser PID tracking ---
+//
+// Playwright launches the Camoufox/Firefox process in its own detached
+// process group so `.close()` can reliably kill the whole tree. That also
+// means the browser does NOT die automatically if the host process dies
+// without running cleanup — a hard crash, an OOM abort, or a `kill -9` all
+// skip our idle-timer-based close. We record the live browser's PID next to
+// this file and reap it on the next load if it's still running under our
+// own hostname. This module has no framework dependency, so these are
+// plain Node primitives rather than a host-provided process-tree helper.
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const LOCK_PATH = path.join(MODULE_DIR, ".perchance-browser.lock.json");
+
+type BrowserLock = { pid: number; hostname: string; startedAt: number };
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the PID exists but we lack permission to signal it.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function killProcessTree(pid: number): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  if (process.platform === "win32") {
+    try {
+      execFileSync("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore" });
+    } catch {
+      /* already gone */
+    }
+    return;
+  }
+  // Playwright makes the launched browser its own process group leader so
+  // it can kill the whole tree (renderer/GPU helpers included) on close.
+  // Signaling the negated pid targets that whole group.
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+async function writeBrowserLock(pid: number): Promise<void> {
+  const lock: BrowserLock = { pid, hostname: os.hostname(), startedAt: Date.now() };
+  await writeFile(LOCK_PATH, JSON.stringify(lock), "utf8").catch(() => {});
+}
+
+async function clearBrowserLock(): Promise<void> {
+  await rm(LOCK_PATH, { force: true }).catch(() => {});
+}
+
+async function reapOrphanedBrowser(): Promise<void> {
+  try {
+    const raw = await readFile(LOCK_PATH, "utf8");
+    const lock = JSON.parse(raw) as Partial<BrowserLock>;
+    if (
+      lock &&
+      typeof lock.pid === "number" &&
+      lock.hostname === os.hostname() &&
+      isPidAlive(lock.pid)
+    ) {
+      killProcessTree(lock.pid);
+    }
+  } catch {
+    // No lock file, or it's unreadable/corrupt — nothing to reap.
+  } finally {
+    await clearBrowserLock();
+  }
+}
+
 // --- Module-level browser pool singleton ---
 
 let pooledBrowser: PlaywrightBrowser | null = null;
@@ -166,53 +251,97 @@ function armIdleTimer(): void {
     pooledContext = null;
     pooledBrowser = null;
     idleTimer = null;
+    void clearBrowserLock();
   }, IDLE_TIMEOUT_MS);
 }
 
-export async function launchCamoufox(options: LaunchOptions = {}): Promise<BrowserContext> {
-  const { headless = true, ...rest } = options;
+// Fresh process load (not a re-import within the same process): reap a
+// leftover Camoufox/Firefox process from a previous crash.
+if (!(globalThis as any).__perchance_camoufox_loaded) {
+  (globalThis as any).__perchance_camoufox_loaded = true;
+  void reapOrphanedBrowser();
+}
 
+// Force-kill the live Camoufox/Firefox process on shutdown, synchronously,
+// so a graceful stop never leaves one running. Guarded so re-importing this
+// module in the same process doesn't stack duplicate listeners.
+if (!(globalThis as any).__perchance_camoufox_shutdown_hook_installed) {
+  (globalThis as any).__perchance_camoufox_shutdown_hook_installed = true;
+  const killPooledBrowser = () => {
+    const pid = pooledBrowser?.process?.()?.pid;
+    if (typeof pid === "number") killProcessTree(pid);
+    void clearBrowserLock();
+  };
+  process.on("SIGTERM", killPooledBrowser);
+  process.on("SIGINT", killPooledBrowser);
+  process.on("exit", killPooledBrowser);
+}
+
+let launchPromise: Promise<BrowserContext> | null = null;
+
+export async function launchCamoufox(options: LaunchOptions = {}): Promise<BrowserContext> {
   // Reuse pooled browser if alive
   if (pooledBrowser && pooledBrowser.isConnected() && pooledContext) {
     armIdleTimer();
     return new PlaywrightContextAdapter(pooledContext, null); // null = don't close browser on adapter.close()
   }
 
-  // Dynamic import so camoufox-js is optional
-  // @ts-ignore - camoufox-js is an optional peer dependency
-  const { Camoufox } = await import("camoufox-js");
+  // Serialize concurrent cold-start launches. Without this, two callers
+  // racing against an idled-out pool would each launch their own Camoufox
+  // process; whichever finished second would silently overwrite the module
+  // singleton, orphaning the first one immediately.
+  if (launchPromise) return launchPromise;
 
-  const browserOrContext = await Camoufox({
-    headless,
-    humanize: true,
-    enable_cache: false,
-    // Critical: allow cross-origin iframe interaction for Turnstile
-    disable_coop: true,
-    i_know_what_im_doing: true,
-    ...rest,
-  } as any);
+  launchPromise = (async () => {
+    const { headless = true, ...rest } = options;
 
-  // camoufox-js may return either a Browser or a BrowserContext
-  if ('newPage' in browserOrContext && 'browser' in browserOrContext && typeof (browserOrContext as any).browser === 'function') {
-    // Already a BrowserContext — extract the browser for proper cleanup
-    pooledContext = browserOrContext as unknown as PlaywrightContext;
-    pooledBrowser = (browserOrContext as any).browser() as PlaywrightBrowser | null;
+    // Dynamic import so camoufox-js is optional
+    // @ts-ignore - camoufox-js is an optional peer dependency
+    const { Camoufox } = await import("camoufox-js");
+
+    const browserOrContext = await Camoufox({
+      headless,
+      humanize: true,
+      enable_cache: false,
+      // Critical: allow cross-origin iframe interaction for Turnstile
+      disable_coop: true,
+      i_know_what_im_doing: true,
+      ...rest,
+    } as any);
+
+    // camoufox-js may return either a Browser or a BrowserContext
+    if ('newPage' in browserOrContext && 'browser' in browserOrContext && typeof (browserOrContext as any).browser === 'function') {
+      // Already a BrowserContext — extract the browser for proper cleanup
+      pooledContext = browserOrContext as unknown as PlaywrightContext;
+      pooledBrowser = (browserOrContext as any).browser() as PlaywrightBrowser | null;
+      const pid = pooledBrowser?.process?.()?.pid;
+      if (typeof pid === "number") void writeBrowserLock(pid);
+      armIdleTimer();
+      return new PlaywrightContextAdapter(pooledContext, null);
+    }
+
+    // It's a Browser, need to create a context
+    const browser = browserOrContext as unknown as PlaywrightBrowser;
+    const ctx = await browser.newContext();
+    pooledBrowser = browser;
+    pooledContext = ctx;
+    const pid = pooledBrowser.process?.()?.pid;
+    if (typeof pid === "number") void writeBrowserLock(pid);
+    (pooledBrowser as any).on?.('disconnected', () => {
+      pooledBrowser = null;
+      pooledContext = null;
+      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+      void clearBrowserLock();
+    });
     armIdleTimer();
-    return new PlaywrightContextAdapter(pooledContext, null);
-  }
+    return new PlaywrightContextAdapter(ctx, null);
+  })();
 
-  // It's a Browser, need to create a context
-  const browser = browserOrContext as unknown as PlaywrightBrowser;
-  const ctx = await browser.newContext();
-  pooledBrowser = browser;
-  pooledContext = ctx;
-  (pooledBrowser as any).on?.('disconnected', () => {
-    pooledBrowser = null;
-    pooledContext = null;
-    if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-  });
-  armIdleTimer();
-  return new PlaywrightContextAdapter(ctx, null);
+  try {
+    return await launchPromise;
+  } finally {
+    launchPromise = null;
+  }
 }
 
 /**
