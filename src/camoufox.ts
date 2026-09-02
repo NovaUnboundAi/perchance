@@ -246,11 +246,19 @@ const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 function armIdleTimer(): void {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
-    if (pooledContext) { try { pooledContext.close(); } catch { /* ignore */ } }
-    if (pooledBrowser) { try { pooledBrowser.close(); } catch { /* ignore */ } }
+    // Snapshot then null the pool immediately so re-entrant launchCamoufox
+    // calls don't observe a half-closed context or race the close promises.
+    const ctx = pooledContext;
+    const browser = pooledBrowser;
     pooledContext = null;
     pooledBrowser = null;
     idleTimer = null;
+    // Fire-and-forget the close promises with .catch attached. Without the
+    // catch, either close() rejecting mid-shutdown (browser already gone,
+    // context/browser close racing each other) becomes an unhandled
+    // rejection that crashes the host process.
+    ctx?.close().catch(() => {});
+    browser?.close().catch(() => {});
     void clearBrowserLock();
   }, IDLE_TIMEOUT_MS);
 }
