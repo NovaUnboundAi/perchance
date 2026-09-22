@@ -67,14 +67,15 @@ class PlaywrightContextAdapter implements BrowserContext {
   }
 
   async close(): Promise<void> {
-    // If this adapter owns the browser (non-pooled), close context + browser.
-    // If pooled (browser === null), closing the shared context would kill it for
-    // other consumers — so just let the idle timer handle cleanup.
+    // Always close the per-call context. This adapter's context is not shared
+    // with anyone else — it was created fresh in launchCamoufox() so Cloudflare
+    // state doesn't accumulate across tool calls.
+    try { await this.ctx.close(); } catch { /* already closed */ }
+    // Only close the browser if this adapter owns it (non-pooled path — not
+    // used in-tree, but the shape is here for external consumers).
     if (this.browser) {
-      await this.ctx.close();
       try { await this.browser.close(); } catch { /* already closed */ }
     }
-    // Pooled: no-op. Caller should close individual pages instead.
   }
 }
 
@@ -237,30 +238,41 @@ async function reapOrphanedBrowser(): Promise<void> {
 }
 
 // --- Module-level browser pool singleton ---
+//
+// The BROWSER is pooled across launchCamoufox() calls (Camoufox cold-start is
+// ~5-10s). The CONTEXT is NOT — every call gets a fresh one. Sharing a context
+// poisons Turnstile: Cloudflare tracks it via cookies/localStorage and once it
+// flags a context as bot-like, every subsequent Turnstile flow on that context
+// fails. A fresh context each call keeps Cloudflare fingerprinting scoped to
+// a single caller invocation.
 
 let pooledBrowser: PlaywrightBrowser | null = null;
-let pooledContext: PlaywrightContext | null = null;
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 function armIdleTimer(): void {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
-    // Snapshot then null the pool immediately so re-entrant launchCamoufox
-    // calls don't observe a half-closed context or race the close promises.
-    const ctx = pooledContext;
     const browser = pooledBrowser;
-    pooledContext = null;
     pooledBrowser = null;
     idleTimer = null;
-    // Fire-and-forget the close promises with .catch attached. Without the
-    // catch, either close() rejecting mid-shutdown (browser already gone,
-    // context/browser close racing each other) becomes an unhandled
-    // rejection that crashes the host process.
-    ctx?.close().catch(() => {});
     browser?.close().catch(() => {});
     void clearBrowserLock();
   }, IDLE_TIMEOUT_MS);
+}
+
+/**
+ * Force the pooled browser to be recycled on the next launchCamoufox() call.
+ * Callers should invoke this after a catastrophic Turnstile failure — the
+ * browser's Cloudflare state may be poisoned in ways that a fresh context
+ * won't fix (IP/TLS fingerprint accumulation over many failed challenges).
+ */
+export function invalidatePooledBrowser(): void {
+  const browser = pooledBrowser;
+  pooledBrowser = null;
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  browser?.close().catch(() => {});
+  void clearBrowserLock();
 }
 
 // Fresh process load (not a re-import within the same process): reap a
@@ -285,13 +297,11 @@ if (!(globalThis as any).__perchance_camoufox_shutdown_hook_installed) {
   process.on("exit", killPooledBrowser);
 }
 
-let launchPromise: Promise<BrowserContext> | null = null;
+let launchPromise: Promise<PlaywrightBrowser> | null = null;
 
-export async function launchCamoufox(options: LaunchOptions = {}): Promise<BrowserContext> {
-  // Reuse pooled browser if alive
-  if (pooledBrowser && pooledBrowser.isConnected() && pooledContext) {
-    armIdleTimer();
-    return new PlaywrightContextAdapter(pooledContext, null); // null = don't close browser on adapter.close()
+async function ensurePooledBrowser(options: LaunchOptions): Promise<PlaywrightBrowser> {
+  if (pooledBrowser && pooledBrowser.isConnected()) {
+    return pooledBrowser;
   }
 
   // Serialize concurrent cold-start launches. Without this, two callers
@@ -317,32 +327,32 @@ export async function launchCamoufox(options: LaunchOptions = {}): Promise<Brows
       ...rest,
     } as any);
 
-    // camoufox-js may return either a Browser or a BrowserContext
-    if ('newPage' in browserOrContext && 'browser' in browserOrContext && typeof (browserOrContext as any).browser === 'function') {
-      // Already a BrowserContext — extract the browser for proper cleanup
-      pooledContext = browserOrContext as unknown as PlaywrightContext;
-      pooledBrowser = (browserOrContext as any).browser() as PlaywrightBrowser | null;
-      const pid = typeof pooledBrowser?.process === 'function' ? pooledBrowser.process()?.pid ?? null : null;
-      if (typeof pid === "number") void writeBrowserLock(pid);
-      armIdleTimer();
-      return new PlaywrightContextAdapter(pooledContext, null);
+    // camoufox-js may return either a Browser or an initial BrowserContext.
+    // In either case we only keep the underlying Browser — contexts are
+    // created per-call so state doesn't accumulate.
+    let browser: PlaywrightBrowser;
+    if (
+      "newPage" in browserOrContext &&
+      "browser" in browserOrContext &&
+      typeof (browserOrContext as any).browser === "function"
+    ) {
+      browser = (browserOrContext as any).browser() as PlaywrightBrowser;
+      try { await (browserOrContext as unknown as PlaywrightContext).close(); } catch {}
+    } else {
+      browser = browserOrContext as unknown as PlaywrightBrowser;
     }
 
-    // It's a Browser, need to create a context
-    const browser = browserOrContext as unknown as PlaywrightBrowser;
-    const ctx = await browser.newContext();
     pooledBrowser = browser;
-    pooledContext = ctx;
-    const pid = typeof pooledBrowser?.process === 'function' ? pooledBrowser.process()?.pid ?? null : null;
+    const pid = typeof browser.process === "function" ? browser.process()?.pid ?? null : null;
     if (typeof pid === "number") void writeBrowserLock(pid);
-    (pooledBrowser as any).on?.('disconnected', () => {
-      pooledBrowser = null;
-      pooledContext = null;
-      if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
-      void clearBrowserLock();
+    (browser as any).on?.("disconnected", () => {
+      if (pooledBrowser === browser) {
+        pooledBrowser = null;
+        if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        void clearBrowserLock();
+      }
     });
-    armIdleTimer();
-    return new PlaywrightContextAdapter(ctx, null);
+    return browser;
   })();
 
   try {
@@ -350,6 +360,14 @@ export async function launchCamoufox(options: LaunchOptions = {}): Promise<Brows
   } finally {
     launchPromise = null;
   }
+}
+
+export async function launchCamoufox(options: LaunchOptions = {}): Promise<BrowserContext> {
+  const browser = await ensurePooledBrowser(options);
+  // Fresh context per call — see comment on the pool singleton above.
+  const ctx = await browser.newContext();
+  armIdleTimer();
+  return new PlaywrightContextAdapter(ctx, null);
 }
 
 /**
