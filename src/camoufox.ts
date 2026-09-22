@@ -67,13 +67,11 @@ class PlaywrightContextAdapter implements BrowserContext {
   }
 
   async close(): Promise<void> {
-    // Always close the per-call context. This adapter's context is not shared
-    // with anyone else — it was created fresh in launchCamoufox() so Cloudflare
-    // state doesn't accumulate across tool calls.
-    try { await this.ctx.close(); } catch { /* already closed */ }
-    // Only close the browser if this adapter owns it (non-pooled path — not
-    // used in-tree, but the shape is here for external consumers).
+    // No-op for pooled contexts (browser === null). The pool owns the
+    // context; the caller uses invalidatePooledContext() to explicitly
+    // rotate cookies after a Turnstile failure poisons them.
     if (this.browser) {
+      try { await this.ctx.close(); } catch { /* already closed */ }
       try { await this.browser.close(); } catch { /* already closed */ }
     }
   }
@@ -180,7 +178,6 @@ function isPidAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    // EPERM means the PID exists but we lack permission to signal it.
     return (err as NodeJS.ErrnoException).code === "EPERM";
   }
 }
@@ -195,9 +192,6 @@ function killProcessTree(pid: number): void {
     }
     return;
   }
-  // Playwright makes the launched browser its own process group leader so
-  // it can kill the whole tree (renderer/GPU helpers included) on close.
-  // Signaling the negated pid targets that whole group.
   try {
     process.kill(-pid, "SIGKILL");
   } catch {
@@ -239,56 +233,78 @@ async function reapOrphanedBrowser(): Promise<void> {
 
 // --- Module-level browser pool singleton ---
 //
-// The BROWSER is pooled across launchCamoufox() calls (Camoufox cold-start is
-// ~5-10s). The CONTEXT is NOT — every call gets a fresh one. Sharing a context
-// poisons Turnstile: Cloudflare tracks it via cookies/localStorage and once it
-// flags a context as bot-like, every subsequent Turnstile flow on that context
-// fails. A fresh context each call keeps Cloudflare fingerprinting scoped to
-// a single caller invocation.
+// Pool BOTH the browser and the context. Reusing the context across tool calls
+// caches Cloudflare's clearance cookies, so subsequent calls hit the fast path
+// (verifyUser returns the userKey without Turnstile) — a ~30s → ~500ms win.
+//
+// A shared context can accumulate bad state though: once Cloudflare flags a
+// context as bot-like, every subsequent Turnstile in that context fails.
+// Callers must explicitly rotate via invalidatePooledContext() when they see
+// a Turnstile failure, and invalidatePooledBrowser() if a fresh context still
+// fails (which points at IP/fingerprint-level flagging).
 
 let pooledBrowser: PlaywrightBrowser | null = null;
+let pooledContext: PlaywrightContext | null = null;
 let idleTimer: ReturnType<typeof setTimeout> | null = null;
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes — well under Perchance's hourly userKey rotation
 
 function armIdleTimer(): void {
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
+    const ctx = pooledContext;
     const browser = pooledBrowser;
+    pooledContext = null;
     pooledBrowser = null;
     idleTimer = null;
+    ctx?.close().catch(() => {});
     browser?.close().catch(() => {});
     void clearBrowserLock();
   }, IDLE_TIMEOUT_MS);
 }
 
 /**
- * Force the pooled browser to be recycled on the next launchCamoufox() call.
- * Callers should invoke this after a catastrophic Turnstile failure — the
- * browser's Cloudflare state may be poisoned in ways that a fresh context
- * won't fix (IP/TLS fingerprint accumulation over many failed challenges).
+ * Force the pooled context to be recycled on the next launchCamoufox() call.
+ * Nukes cookies/localStorage without recycling the whole browser process.
+ * Call this after Turnstile fails inside a call — the context's Cloudflare
+ * state may be poisoned in ways that retrying inside it can't fix.
+ */
+export function invalidatePooledContext(): void {
+  const ctx = pooledContext;
+  pooledContext = null;
+  ctx?.close().catch(() => {});
+}
+
+/**
+ * Force the pooled BROWSER (and its context) to be recycled on the next
+ * launchCamoufox() call. Reserved for cases where even a fresh context can't
+ * pass Turnstile — usually means the browser's TLS/JA3 fingerprint or IP has
+ * been accumulating "bot-like" scoring at Cloudflare.
  */
 export function invalidatePooledBrowser(): void {
+  const ctx = pooledContext;
   const browser = pooledBrowser;
+  pooledContext = null;
   pooledBrowser = null;
   if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  ctx?.close().catch(() => {});
   browser?.close().catch(() => {});
   void clearBrowserLock();
 }
 
-// Fresh process load (not a re-import within the same process): reap a
-// leftover Camoufox/Firefox process from a previous crash.
+// Fresh process (Gateway start, not a plugin hot-reload within the same
+// process): reap a leftover Camoufox/Firefox process from a previous crash.
 if (!(globalThis as any).__perchance_camoufox_loaded) {
   (globalThis as any).__perchance_camoufox_loaded = true;
   void reapOrphanedBrowser();
 }
 
 // Force-kill the live Camoufox/Firefox process on shutdown, synchronously,
-// so a graceful stop never leaves one running. Guarded so re-importing this
-// module in the same process doesn't stack duplicate listeners.
+// so a graceful stop never leaves one running. Guarded so a plugin
+// hot-reload doesn't stack duplicate listeners on the shared process object.
 if (!(globalThis as any).__perchance_camoufox_shutdown_hook_installed) {
   (globalThis as any).__perchance_camoufox_shutdown_hook_installed = true;
   const killPooledBrowser = () => {
-    const pid = typeof pooledBrowser?.process === 'function' ? pooledBrowser.process()?.pid ?? null : null;
+    const pid = pooledBrowser?.process?.()?.pid;
     if (typeof pid === "number") killProcessTree(pid);
     void clearBrowserLock();
   };
@@ -304,7 +320,7 @@ async function ensurePooledBrowser(options: LaunchOptions): Promise<PlaywrightBr
     return pooledBrowser;
   }
 
-  // Serialize concurrent cold-start launches. Without this, two callers
+  // Serialize concurrent cold-start launches. Without this, two tool calls
   // racing against an idled-out pool would each launch their own Camoufox
   // process; whichever finished second would silently overwrite the module
   // singleton, orphaning the first one immediately.
@@ -328,8 +344,8 @@ async function ensurePooledBrowser(options: LaunchOptions): Promise<PlaywrightBr
     } as any);
 
     // camoufox-js may return either a Browser or an initial BrowserContext.
-    // In either case we only keep the underlying Browser — contexts are
-    // created per-call so state doesn't accumulate.
+    // We only keep the underlying Browser — the initial context (if returned)
+    // is discarded so ensurePooledContext() can create a fresh one when needed.
     let browser: PlaywrightBrowser;
     if (
       "newPage" in browserOrContext &&
@@ -343,11 +359,12 @@ async function ensurePooledBrowser(options: LaunchOptions): Promise<PlaywrightBr
     }
 
     pooledBrowser = browser;
-    const pid = typeof browser.process === "function" ? browser.process()?.pid ?? null : null;
+    const pid = typeof browser.process === "function" ? browser.process()?.pid : null;
     if (typeof pid === "number") void writeBrowserLock(pid);
     (browser as any).on?.("disconnected", () => {
       if (pooledBrowser === browser) {
         pooledBrowser = null;
+        pooledContext = null;
         if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
         void clearBrowserLock();
       }
@@ -362,10 +379,16 @@ async function ensurePooledBrowser(options: LaunchOptions): Promise<PlaywrightBr
   }
 }
 
+async function ensurePooledContext(browser: PlaywrightBrowser): Promise<PlaywrightContext> {
+  if (pooledContext) return pooledContext;
+  const ctx = await browser.newContext();
+  pooledContext = ctx;
+  return ctx;
+}
+
 export async function launchCamoufox(options: LaunchOptions = {}): Promise<BrowserContext> {
   const browser = await ensurePooledBrowser(options);
-  // Fresh context per call — see comment on the pool singleton above.
-  const ctx = await browser.newContext();
+  const ctx = await ensurePooledContext(browser);
   armIdleTimer();
   return new PlaywrightContextAdapter(ctx, null);
 }

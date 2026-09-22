@@ -53,19 +53,39 @@ interface KeyEntry {
 }
 
 const USER_KEY_REGEX = /"userKey":"([^"]+)"/;
-const DEFAULT_KEY_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const TURNSTILE_ATTEMPT_TIMEOUT_MS = 90_000;
-const TURNSTILE_ATTEMPTS = 3;
-const TURNSTILE_RETRY_BACKOFF_MS = 2_000;
 const IFRAME_POLL_DEADLINE_MS = 30_000;
 const IFRAME_POLL_INTERVAL_MS = 500;
 const GENERATE_CLICK_SETTLE_MS = 1_000;
 const KEY_POLL_INTERVAL_MS = 500;
+// Perchance rotates userKeys at the top of each hour, so cache expires just
+// before the next hour boundary rather than on a rolling clock. A safety
+// margin (30s) leaves room for clock skew and in-flight requests.
+const HOUR_BOUNDARY_SAFETY_MARGIN_MS = 30_000;
+
+/**
+ * Module-level userKey cache shared across every Generator instance in the
+ * process. Nova-tools spawns a fresh Generator per tool call, so per-instance
+ * caching only helps within one call. Sharing at module level means the
+ * expensive Turnstile flow only runs once per hour instead of once per call.
+ */
+const sharedUserKeyCache = new Map<string, { key: string; expiresAt: number }>();
+
+function nextHourBoundaryMs(now = Date.now()): number {
+  const d = new Date(now);
+  d.setUTCMinutes(0, 0, 0);
+  d.setUTCHours(d.getUTCHours() + 1);
+  return d.getTime();
+}
+
+/** Invalidate the shared userKey cache for a given baseUrl (or all baseUrls). */
+export function invalidateSharedUserKey(baseUrl?: string): void {
+  if (baseUrl) sharedUserKeyCache.delete(baseUrl);
+  else sharedUserKeyCache.clear();
+}
 
 export abstract class Generator {
   protected browserContext: BrowserContext | null = null;
-  private keyCache: KeyEntry | null = null;
-  protected readonly keyTtlMs: number = DEFAULT_KEY_TTL_MS;
 
   /** Inject a browser context (e.g. from Camoufox or Playwright). */
   setBrowserContext(ctx: BrowserContext): void {
@@ -80,57 +100,49 @@ export abstract class Generator {
   /**
    * Return a valid Perchance userKey.
    *
-   * Fast path is a single verifyUser GET — succeeds when Cloudflare has a
-   * clearance cookie from a recent Turnstile pass. When it doesn't, we fall
-   * through to the Turnstile flow, which is inherently stochastic against
-   * headless browsers even with Camoufox — so we retry up to N times and
-   * re-attempt the fast path between tries (a partial Turnstile pass may have
-   * set a usable cookie before the challenge itself failed).
+   * Path in order of cost:
+   *   1. Shared module-level cache (0ms). Valid until the top of the hour.
+   *   2. Fast path via /verifyUser GET (~500ms). Succeeds when the pooled
+   *      browser context has a Cloudflare clearance cookie from a prior pass.
+   *   3. Full Turnstile flow (~15-30s). Stochastic against headless browsers;
+   *      we do a single attempt here and let the caller rotate the browser
+   *      context and retry via ensureUserKey again if this throws. Retrying in
+   *      the same context can't help — once Cloudflare has flagged a context,
+   *      re-issuing the challenge in it will keep failing.
    */
   async ensureUserKey(baseUrl: string): Promise<string> {
-    if (this.keyCache && Date.now() < this.keyCache.expiresAt) {
-      return this.keyCache.key;
+    const cached = sharedUserKeyCache.get(baseUrl);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.key;
     }
 
     const fast = await this.getKeyFast(baseUrl);
-    if (fast) return this.cacheAndReturn(fast);
+    if (fast) return this.cacheAndReturn(baseUrl, fast);
 
-    const failures: string[] = [];
-    for (let attempt = 1; attempt <= TURNSTILE_ATTEMPTS; attempt++) {
-      try {
-        const key = await this.getKeyViaTurnstile();
-        if (key) return this.cacheAndReturn(key);
-        failures.push(`attempt ${attempt}: turnstile completed without a userKey`);
-      } catch (error) {
-        failures.push(`attempt ${attempt}: ${(error as Error)?.message ?? String(error)}`);
-      }
-
-      if (attempt < TURNSTILE_ATTEMPTS) {
-        // A partial pass may have set the Cloudflare cookie server-side even
-        // if we didn't intercept the userKey. Cheap to check between tries.
-        const between = await this.getKeyFast(baseUrl);
-        if (between) return this.cacheAndReturn(between);
-        await this.sleep(TURNSTILE_RETRY_BACKOFF_MS);
-      }
+    try {
+      const key = await this.getKeyViaTurnstile();
+      if (key) return this.cacheAndReturn(baseUrl, key);
+      throw new AuthenticationError(
+        "Turnstile completed without a userKey (challenge blocked or verifyUser response format changed)",
+      );
+    } catch (error) {
+      throw new AuthenticationError(
+        `Failed to retrieve user key: ${(error as Error)?.message ?? String(error)}`,
+      );
     }
-
-    throw new AuthenticationError(
-      `Failed to retrieve user key after ${TURNSTILE_ATTEMPTS} Turnstile attempts. ${failures.join("; ")}`,
-    );
   }
 
-  /** Invalidate the key cache (e.g. after a 401 from the API). */
-  invalidateKey(): void {
-    this.keyCache = null;
+  /** Invalidate the shared cache. Mostly used after an invalid_key API response. */
+  invalidateKey(baseUrl?: string): void {
+    invalidateSharedUserKey(baseUrl);
   }
 
-  private cacheAndReturn(key: string): string {
-    this.keyCache = { key, expiresAt: Date.now() + this.keyTtlMs };
+  private cacheAndReturn(baseUrl: string, key: string): string {
+    sharedUserKeyCache.set(baseUrl, {
+      key,
+      expiresAt: nextHourBoundaryMs() - HOUR_BOUNDARY_SAFETY_MARGIN_MS,
+    });
     return key;
-  }
-
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -265,6 +277,8 @@ export abstract class Generator {
       } catch { /* ignore */ }
       this.browserContext = null;
     }
-    this.keyCache = null;
+    // Note: shared userKey cache is intentionally NOT cleared here — it's
+    // module-level and shared with future Generator instances. Callers who
+    // need to invalidate it use invalidateSharedUserKey().
   }
 }
