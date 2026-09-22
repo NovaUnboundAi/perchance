@@ -19,15 +19,15 @@
   ],
   "license": "SEE LICENSE IN LICENSE",
   "devDependencies": {
-    "typescript": "^5.5.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
   },
   "dependencies": {
-    "camoufox-js": "0.11.0",
-    "playwright-core": "1.58.0"
+    "camoufox-js": "^0.12.0",
+    "playwright-core": "^1.58.0"
   },
   "allowScripts": {
-    "better-sqlite3@12.11.1": true,
-    "impit": false
+    "better-sqlite3@13.0.3": true,
+    "impit@0.14.5": true
   }
 }
