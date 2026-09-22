@@ -54,7 +54,13 @@ interface KeyEntry {
 
 const USER_KEY_REGEX = /"userKey":"([^"]+)"/;
 const DEFAULT_KEY_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const TURNSTILE_TIMEOUT_MS = 60_000;
+const TURNSTILE_ATTEMPT_TIMEOUT_MS = 90_000;
+const TURNSTILE_ATTEMPTS = 3;
+const TURNSTILE_RETRY_BACKOFF_MS = 2_000;
+const IFRAME_POLL_DEADLINE_MS = 30_000;
+const IFRAME_POLL_INTERVAL_MS = 500;
+const GENERATE_CLICK_SETTLE_MS = 1_000;
+const KEY_POLL_INTERVAL_MS = 500;
 
 export abstract class Generator {
   protected browserContext: BrowserContext | null = null;
@@ -74,31 +80,57 @@ export abstract class Generator {
   /**
    * Return a valid Perchance userKey.
    *
-   * Tries the fast path first (direct verifyUser navigation).
-   * Falls back to the full Turnstile flow if Cloudflare requires
-   * a fresh challenge. Uses a TTL cache to avoid redundant requests.
+   * Fast path is a single verifyUser GET — succeeds when Cloudflare has a
+   * clearance cookie from a recent Turnstile pass. When it doesn't, we fall
+   * through to the Turnstile flow, which is inherently stochastic against
+   * headless browsers even with Camoufox — so we retry up to N times and
+   * re-attempt the fast path between tries (a partial Turnstile pass may have
+   * set a usable cookie before the challenge itself failed).
    */
   async ensureUserKey(baseUrl: string): Promise<string> {
-    // Check TTL cache first
     if (this.keyCache && Date.now() < this.keyCache.expiresAt) {
       return this.keyCache.key;
     }
 
-    const key = await this.getKeyFast(baseUrl) ?? await this.getKeyViaTurnstile();
-    if (!key) {
-      throw new AuthenticationError("Failed to retrieve user key");
+    const fast = await this.getKeyFast(baseUrl);
+    if (fast) return this.cacheAndReturn(fast);
+
+    const failures: string[] = [];
+    for (let attempt = 1; attempt <= TURNSTILE_ATTEMPTS; attempt++) {
+      try {
+        const key = await this.getKeyViaTurnstile();
+        if (key) return this.cacheAndReturn(key);
+        failures.push(`attempt ${attempt}: turnstile completed without a userKey`);
+      } catch (error) {
+        failures.push(`attempt ${attempt}: ${(error as Error)?.message ?? String(error)}`);
+      }
+
+      if (attempt < TURNSTILE_ATTEMPTS) {
+        // A partial pass may have set the Cloudflare cookie server-side even
+        // if we didn't intercept the userKey. Cheap to check between tries.
+        const between = await this.getKeyFast(baseUrl);
+        if (between) return this.cacheAndReturn(between);
+        await this.sleep(TURNSTILE_RETRY_BACKOFF_MS);
+      }
     }
 
-    this.keyCache = {
-      key,
-      expiresAt: Date.now() + this.keyTtlMs,
-    };
-    return key;
+    throw new AuthenticationError(
+      `Failed to retrieve user key after ${TURNSTILE_ATTEMPTS} Turnstile attempts. ${failures.join("; ")}`,
+    );
   }
 
   /** Invalidate the key cache (e.g. after a 401 from the API). */
   invalidateKey(): void {
     this.keyCache = null;
+  }
+
+  private cacheAndReturn(key: string): string {
+    this.keyCache = { key, expiresAt: Date.now() + this.keyTtlMs };
+    return key;
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
@@ -113,7 +145,7 @@ export abstract class Generator {
     try {
       await page.goto(
         `${baseUrl}/verifyUser?thread=0&__cacheBust=${cacheBust}`,
-        { waitUntil: "networkidle", timeout: 15_000 },
+        { waitUntil: "domcontentloaded", timeout: 15_000 },
       );
       const content = await page.content();
       const match = content.match(USER_KEY_REGEX);
@@ -127,9 +159,13 @@ export abstract class Generator {
   }
 
   /**
-   * Full Turnstile flow: load the Perchance AI image generator page,
-   * inject a dummy prompt, click Generate, and intercept the
-   * verifyUser?token=*** response to extract the userKey.
+   * Full Turnstile flow: load the Perchance AI image generator page, wait for
+   * the generator iframe to appear, inject a prompt, click Generate, and
+   * intercept the verifyUser?token=*** response for the userKey.
+   *
+   * Throws with a distinct message per failure mode (iframe never appeared,
+   * generate button not found, Turnstile timed out) so the caller can log the
+   * actual reason instead of a generic null.
    */
   private async getKeyViaTurnstile(): Promise<string | null> {
     if (!this.browserContext) return null;
@@ -138,7 +174,6 @@ export abstract class Generator {
     const page = await this.browserContext.newPage();
 
     try {
-      // Intercept verifyUser responses
       page.on("response", async (res: BrowserResponse) => {
         if (key) return;
         if (res.url().includes("verifyUser")) {
@@ -146,41 +181,74 @@ export abstract class Generator {
             const body = await res.text();
             const m = body.match(USER_KEY_REGEX);
             if (m) key = m[1];
-          } catch { /* ignore */ }
+          } catch { /* ignore body read races on abort */ }
         }
       });
 
+      // domcontentloaded instead of networkidle — Perchance keeps polling
+      // things, so networkidle may never fire and we'd waste our budget on
+      // the goto instead of on the Turnstile challenge itself.
       await page.goto(
         "https://perchance.org/ai-text-to-image-generator",
-        { waitUntil: "networkidle", timeout: 60_000 },
-      );
-      await page.waitForTimeout(15_000);
-
-      // Find the generator output iframe
-      const target = page.frames().find(
-        (f) =>
-          f.url().includes("perchance.org") &&
-          f.url().includes("ai-text-to-image-generator") &&
-          f.url() !== page.url(),
+        { waitUntil: "domcontentloaded", timeout: 60_000 },
       );
 
-      if (!target) return null;
+      // Poll for the generator iframe. Perchance loads it lazily; blind
+      // sleeping is either too short (miss it) or too long (waste budget).
+      const iframeDeadline = Date.now() + IFRAME_POLL_DEADLINE_MS;
+      let target: BrowserFrame | undefined;
+      while (Date.now() < iframeDeadline) {
+        target = page.frames().find(
+          (f) =>
+            f.url().includes("perchance.org") &&
+            f.url().includes("ai-text-to-image-generator") &&
+            f.url() !== page.url(),
+        );
+        if (target) break;
+        await page.waitForTimeout(IFRAME_POLL_INTERVAL_MS);
+      }
+      if (!target) {
+        throw new Error(
+          `generator iframe never appeared within ${IFRAME_POLL_DEADLINE_MS / 1000}s`,
+        );
+      }
 
-      // Inject a dummy prompt to enable the Generate button
-      await target.evaluate(
-        () => { const ta = document.querySelector("textarea"); if (ta) { ta.value = "test"; ta.dispatchEvent(new Event("input", {bubbles: true})); ta.dispatchEvent(new Event("change", {bubbles: true})); } }
-      );
-      await page.waitForTimeout(1_000);
+      // Fill the prompt so the Generate button becomes enabled.
+      await target.evaluate(() => {
+        const ta = document.querySelector("textarea");
+        if (ta) {
+          ta.value = "test";
+          ta.dispatchEvent(new Event("input", { bubbles: true }));
+          ta.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      });
+      await page.waitForTimeout(GENERATE_CLICK_SETTLE_MS);
 
-      // Click Generate to trigger the Turnstile verification flow
-      await target.evaluate(
-        () => { const btns = document.querySelectorAll("button"); for (const b of btns) { if ((b.textContent || "").toLowerCase().includes("generate")) { b.click(); return; } } }
-      );
+      // Report explicitly whether the button was actually clicked. Silent
+      // failure here has cost us hours of "why did Turnstile time out?"
+      const clicked = await target.evaluate<boolean>(() => {
+        const btns = document.querySelectorAll("button");
+        for (const b of btns) {
+          if ((b.textContent || "").toLowerCase().includes("generate")) {
+            b.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (!clicked) {
+        throw new Error("generate button not found in iframe");
+      }
 
-      // Wait for Turnstile to solve and userKey to arrive
-      const deadline = Date.now() + TURNSTILE_TIMEOUT_MS;
+      const deadline = Date.now() + TURNSTILE_ATTEMPT_TIMEOUT_MS;
       while (!key && Date.now() < deadline) {
-        await page.waitForTimeout(1_000);
+        await page.waitForTimeout(KEY_POLL_INTERVAL_MS);
+      }
+
+      if (!key) {
+        throw new Error(
+          `Turnstile did not deliver a userKey within ${TURNSTILE_ATTEMPT_TIMEOUT_MS / 1000}s (challenge blocked, network stalled, or verifyUser response format changed)`,
+        );
       }
 
       return key;
