@@ -145,13 +145,24 @@ export class ImageResult {
 
 export class ImageGenerator extends Generator {
   private static readonly BASE_URL = BASE_URL;
+  private static readonly OVERALL_DEADLINE_MS = 180_000;
+  private static readonly POLL_INTERVAL_MS = 2_000;
+  private static readonly KEY_REFRESH_LIMIT = 1;
 
   /**
    * Generate an image.
    *
-   * Self-healing: if the userKey is rejected by the API, a fresh
-   * key is obtained (which may trigger the full Turnstile flow if
-   * Cloudflare clearance has expired) and the request is retried.
+   * Perchance's protocol: POST to /generate with a stable requestId and keep
+   * polling. Early polls return `waiting_for_prev_request_to_finish` quickly;
+   * the eventual "ready" poll blocks server-side until the image is finished
+   * (~20-30s typical). Rolling a fresh requestId per attempt would start a new
+   * request each time and queue behind the previous one forever — that was the
+   * historical bug that produced the misleading "user key rejected" errors.
+   *
+   * The Turnstile flow (used only when the key cache is cold) also submits a
+   * "test" generation to trigger the challenge, so on a fresh key our very
+   * first poll is queued behind that. Reusing the requestId lets us wait it
+   * out and get our image on the same requestId.
    */
   async image(prompt: string, options: GenerateImageOptions = {}): Promise<ImageResult> {
     const {
@@ -164,48 +175,68 @@ export class ImageGenerator extends Generator {
     const resolution = SHAPE_TO_RESOLUTION[shape];
     if (!resolution) throw new Error(`Invalid shape: ${shape}`);
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const key = await this.ensureUserKey(BASE_URL);
+    const requestId = `aiImageCompletion${Math.floor(Math.random() * 2 ** 30)}`;
+    const deadline = Date.now() + ImageGenerator.OVERALL_DEADLINE_MS;
 
-      const response = await this.generateWithKey(
-        key, resolution, prompt, negativePrompt, seed, guidanceScale,
+    let key = await this.ensureUserKey(BASE_URL);
+    let keyRefreshes = 0;
+    let lastResponse: unknown = null;
+
+    while (Date.now() < deadline) {
+      const response = await this.postGenerate(
+        key, requestId, resolution, prompt, negativePrompt, seed, guidanceScale,
       );
+      lastResponse = response;
 
-      // Success
-      if (response.imageId !== undefined) {
+      // Success — the server finished the request and returned the image data.
+      const record = response as Record<string, unknown> | null;
+      if (record && typeof record.imageId === "string") {
         return new ImageResult(this, response as ImageResultData);
       }
 
-      // Rate-limited: server says a previous request is still processing
-      const status = (response as Record<string, unknown>).status;
-      if (status === "waiting_for_prev_request_to_finish" && attempt < 2) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
+      const status = record?.status;
+
+      // Still queued (either behind Perchance's own Turnstile-triggered "test"
+      // gen, or behind another user's request) — poll again with the same id.
+      if (status === "waiting_for_prev_request_to_finish") {
+        await new Promise(resolve => setTimeout(resolve, ImageGenerator.POLL_INTERVAL_MS));
         continue;
       }
 
-      // Auth failure: try refreshing the key once
-      if (attempt === 0) {
+      // The key we cached is no longer accepted. Force a fresh one and retry
+      // the same requestId, but only once — a persistent invalid_key is a real
+      // failure we shouldn't hide behind an infinite refresh loop.
+      if (status === "invalid_key" && keyRefreshes < ImageGenerator.KEY_REFRESH_LIMIT) {
         this.invalidateKey();
+        key = await this.ensureUserKey(BASE_URL);
+        keyRefreshes += 1;
         continue;
       }
 
+      // Unknown status, or invalid_key after we already refreshed. Surface the
+      // actual payload so we can see new Perchance statuses in the logs.
       throw new AuthenticationError(
-        `User key rejected after retry. Response: ${JSON.stringify(response)}`,
+        `Perchance /generate rejected the request. status=${String(status ?? "(none)")}, ` +
+        `response=${JSON.stringify(response).slice(0, 400)}`,
       );
     }
 
-    throw new AuthenticationError("Failed to generate image after retries");
+    throw new AuthenticationError(
+      `Perchance /generate did not deliver an image within ${ImageGenerator.OVERALL_DEADLINE_MS / 1000}s. ` +
+      `Last response: ${JSON.stringify(lastResponse).slice(0, 400)}`,
+    );
   }
 
-  /** Make the actual API call. Returns the JSON response. */
-  private async generateWithKey(
+  /** POST once to /generate with the caller's requestId and return the parsed JSON. */
+  private async postGenerate(
     key: string,
+    requestId: string,
     resolution: string,
     prompt: string,
     negativePrompt: string | null,
     seed: number,
     guidanceScale: number,
-  ): Promise<Partial<ImageResultData>> {
+  ): Promise<Partial<ImageResultData> | null> {
     const ctx = this.getBrowserContext();
     if (!ctx) throw new ConnectionError("No browser context available");
 
@@ -215,7 +246,6 @@ export class ImageGenerator extends Generator {
         `${BASE_URL}/verifyUser?thread=0&__cacheBust=${Math.random()}`,
       );
 
-      const requestId = `aiImageCompletion${Math.floor(Math.random() * 2 ** 30)}`;
       const url =
         `${BASE_URL}/generate?userKey=${key}` +
         `&requestId=${requestId}` +
